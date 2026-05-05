@@ -28,8 +28,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -45,7 +47,9 @@ VIDEO_EXTS = {
 SIDECAR_EXTS = {".aae", ".xmp", ".thm", ".lrv"}
 MEDIA_EXTS = PHOTO_EXTS | VIDEO_EXTS | SIDECAR_EXTS
 SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".localized"}
-SKIP_DIR_NAMES = {".Trashes", ".Spotlight-V100", ".fseventsd", "@eaDir", ".AppleDouble"}
+SKIP_DIR_NAMES = {".Trashes", ".Spotlight-V100", ".fseventsd", "@eaDir", ".AppleDouble",
+                  "$RECYCLE.BIN", "System Volume Information", ".bzvol",
+                  "RECYCLER", "lost+found"}
 
 PHOTO_PREF = [".heic", ".heif", ".dng", ".cr3", ".cr2", ".nef", ".arw",
               ".raf", ".rw2", ".orf", ".srw", ".pef", ".raw",
@@ -69,6 +73,9 @@ def media_kind(ext):
 def init_db(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
+    # WAL mode lets readers run concurrently with writers; persistent across connections.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS files (
             source_path TEXT PRIMARY KEY,
@@ -95,6 +102,18 @@ def init_db(path):
     return conn
 
 
+_thread_local = threading.local()
+
+
+def get_thread_conn(manifest_path):
+    """Per-thread SQLite connection. Each worker thread opens its own conn against
+    the same DB file. WAL mode (set once in init_db) makes this safe."""
+    if not hasattr(_thread_local, "conn"):
+        _thread_local.conn = sqlite3.connect(str(manifest_path), timeout=30.0)
+        _thread_local.conn.execute("PRAGMA synchronous=NORMAL")
+    return _thread_local.conn
+
+
 def md5_file(path, chunk=1024 * 1024):
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -106,19 +125,32 @@ def md5_file(path, chunk=1024 * 1024):
     return h.hexdigest()
 
 
-def walk_media(root):
-    """Yield Path objects for media files under root, skipping junk."""
+def walk_media(root, extra_skip_dirs=None):
+    """
+    Walk root for media files. Returns (media_paths, json_dirs).
+    json_dirs is the set of directories containing any *.json file — used
+    to skip the slow iterdir() fallback in find_takeout_sidecar() for
+    directories that can't possibly hold a Takeout/osxphotos sidecar.
+    """
+    skip = SKIP_DIR_NAMES | set(extra_skip_dirs or [])
     root = Path(root).resolve()
+    media_paths = []
+    json_dirs = set()
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames
-                       if d not in SKIP_DIR_NAMES and not d.startswith("._")]
+                       if d not in skip and not d.startswith("._")]
+        has_json = False
         for name in filenames:
             if name in SKIP_NAMES or name.startswith("._"):
                 continue
+            if name.lower().endswith(".json"):
+                has_json = True
             ext = Path(name).suffix.lower()
-            if ext not in MEDIA_EXTS:
-                continue
-            yield Path(dirpath) / name
+            if ext in MEDIA_EXTS:
+                media_paths.append(Path(dirpath) / name)
+        if has_json:
+            json_dirs.add(dirpath)
+    return media_paths, json_dirs
 
 
 def group_sidecars(paths):
@@ -162,13 +194,19 @@ def pick_primary(members, pref_list, kind):
     return candidates[0]
 
 
-def find_takeout_sidecar(photo_path):
+def find_takeout_sidecar(photo_path, json_dirs=None):
     """
-    Google Takeout writes a JSON sidecar named like
-    {photo}.supplemental-metadata.json — but the suffix is truncated
-    unpredictably to fit the 255-byte filename limit (.supplemen.json,
-    .suppl.json, .supp.json, .json, etc.). Look for any .json file
-    whose name starts with the photo's filename.
+    Look for a JSON sidecar that carries date metadata for `photo_path`.
+    Handles two formats with the same lookup pattern:
+    - Google Takeout: `{photo}.supplemental-metadata.json` and its
+      unpredictable truncations (`.supplemen.json`, `.suppl.json`, etc.) due
+      to Google fitting the suffix into the 255-byte filename limit.
+    - osxphotos `--sidecar json`: `{photo}.json` (exiftool-format).
+
+    `json_dirs`, if supplied, is the set of directories known to contain at
+    least one *.json file — when supplied, the slow iterdir() fallback is
+    skipped for parents not in the set. Massive speedup on archives without
+    sidecars (e.g. an old photo backup drive).
     """
     photo_name = photo_path.name
     parent = photo_path.parent
@@ -184,6 +222,10 @@ def find_takeout_sidecar(photo_path):
     for c in candidates:
         if c.is_file():
             return c
+    # Skip the expensive iterdir fallback if this dir is known to contain
+    # no .json files at all.
+    if json_dirs is not None and str(parent) not in json_dirs:
+        return None
     # Fallback: any file in same dir starting with photo_name + "." and ending .json
     try:
         for entry in parent.iterdir():
@@ -196,29 +238,52 @@ def find_takeout_sidecar(photo_path):
 
 
 def read_takeout_date(json_path):
-    """Parse a Google Takeout JSON sidecar for photoTakenTime. Returns datetime or None."""
+    """
+    Parse a JSON sidecar for a capture date. Handles two formats:
+    1. Google Takeout: dict with `photoTakenTime.timestamp` (Unix epoch).
+    2. osxphotos `--sidecar json`: list of dicts with exiftool-style
+       `Group:Tag` keys like `EXIF:DateTimeOriginal` (YYYY:MM:DD HH:MM:SS).
+    Returns datetime or None.
+    """
     try:
         with open(json_path, "rb") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    pt = data.get("photoTakenTime") or data.get("creationTime")
-    if not isinstance(pt, dict):
-        return None
-    ts = pt.get("timestamp")
-    if not ts:
-        return None
-    try:
-        return datetime.utcfromtimestamp(int(ts))
-    except (TypeError, ValueError):
-        return None
+
+    # Format 1: Google Takeout
+    if isinstance(data, dict):
+        pt = data.get("photoTakenTime") or data.get("creationTime")
+        if isinstance(pt, dict) and pt.get("timestamp"):
+            try:
+                dt = datetime.utcfromtimestamp(int(pt["timestamp"]))
+                if 1980 <= dt.year <= 2100:
+                    return dt
+            except (TypeError, ValueError):
+                pass
+
+    # Format 2: osxphotos / exiftool — list of records (or single dict)
+    records = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    # Priority order of date tags (most authoritative first)
+    primary_tags = ("datetimeoriginal", "createdate", "mediacreatedate",
+                    "trackcreatedate", "datecreated")
+    for tag in primary_tags:
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            for key, val in rec.items():
+                if key.lower().split(":")[-1] == tag:
+                    dt = parse_exif_dt(val)
+                    if dt and 1980 <= dt.year <= 2100:
+                        return dt
+    return None
 
 
-def read_takeout_dates(paths, log):
+def read_takeout_dates(paths, log, json_dirs=None):
     """Look up Takeout JSON sidecars for each path. Returns {abs_path: datetime}."""
     out = {}
     for p in paths:
-        sidecar = find_takeout_sidecar(p)
+        sidecar = find_takeout_sidecar(p, json_dirs=json_dirs)
         if sidecar is None:
             continue
         dt = read_takeout_date(sidecar)
@@ -344,12 +409,21 @@ def rclone_copy(src, dest_dir, dest_name, log, dry_run=False):
 
 
 def already_processed(conn, path):
+    """Returns the manifest row (or None). Raises FileNotFoundError if path is gone."""
     st = path.stat()
     row = conn.execute(
         "SELECT status, md5, target_path FROM files WHERE source_path = ? AND size = ? AND mtime = ?",
         (str(path), st.st_size, st.st_mtime),
     ).fetchone()
     return row
+
+
+def source_root_alive(source_root):
+    """True if the source root directory is still accessible. Used to detect drive disconnects."""
+    try:
+        return Path(source_root).is_dir() and any(True for _ in os.scandir(source_root))
+    except (OSError, FileNotFoundError):
+        return False
 
 
 def md5_seen(conn, md5):
@@ -378,15 +452,21 @@ def record(conn, path, md5, status, target_path, kind, shutter_dt):
     conn.commit()
 
 
-def process_group(group, conn, dest_root, log, dry_run, exif_cache, takeout_cache):
+def process_group(group, manifest_path, dest_root, log, dry_run, exif_cache, takeout_cache, move_after_upload=False):
+    conn = get_thread_conn(manifest_path)
     """Process one sidecar group. Returns counts dict."""
-    counts = {"copied": 0, "copied_mtime": 0, "duplicate": 0, "unknown_date": 0, "skipped_resume": 0, "errors": 0}
+    counts = {"copied": 0, "copied_mtime": 0, "duplicate": 0, "unknown_date": 0, "skipped_resume": 0, "errors": 0, "moved_deleted": 0}
     primary = group["primary"]
     members = group["members"]
     kind = group["kind"]
 
     # Resume check on primary — if primary was processed cleanly, skip group.
-    prior = already_processed(conn, primary)
+    try:
+        prior = already_processed(conn, primary)
+    except FileNotFoundError:
+        log.warning("source vanished (drive disconnect?): %s", primary)
+        counts["errors"] += 1
+        return counts
     if prior and prior[0] in ("copied", "copied_mtime", "duplicate", "unknown_date"):
         counts["skipped_resume"] += len(members)
         return counts
@@ -439,8 +519,19 @@ def process_group(group, conn, dest_root, log, dry_run, exif_cache, takeout_cach
             if date_src == "takeout":
                 tag = "copyT"
             log.info("%s %s -> %s", tag, m, final)
-            record(conn, m, md5, status, final, media_kind(m.suffix), shutter_dt)
+            # Don't pollute the manifest in dry-run — otherwise resume on the
+            # real run would skip files that were never actually uploaded.
+            if not dry_run:
+                record(conn, m, md5, status, final, media_kind(m.suffix), shutter_dt)
             counts[status] = counts.get(status, 0) + 1
+
+            if move_after_upload and not dry_run and status in ("copied", "copied_mtime"):
+                try:
+                    m.unlink()
+                    log.info("rm   %s (uploaded)", m)
+                    counts["moved_deleted"] = counts.get("moved_deleted", 0) + 1
+                except OSError as e:
+                    log.warning("could not delete source %s: %s", m, e)
         except Exception as e:
             log.error("error on %s: %s", m, e)
             try:
@@ -478,6 +569,20 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="Walk and hash but don't upload")
     ap.add_argument("--limit", type=int, default=0, help="Process at most N groups (smoke test)")
     ap.add_argument("--exif-batch", type=int, default=200, help="exiftool batch size")
+    ap.add_argument("--workers", type=int, default=6,
+                    help="Concurrent upload workers. 1 = serial. Default 6 — the "
+                         "bottleneck is B2's per-file overhead, not bandwidth, so "
+                         "concurrency multiplies throughput. Set higher (10-12) on "
+                         "a fast connection.")
+    ap.add_argument("--skip-dir", action="append", default=[],
+                    help="Directory NAME (not path) to skip. Repeatable. "
+                         "Stacks on top of built-in skips ($RECYCLE.BIN etc.). "
+                         "Example: --skip-dir 'iTunes Media' --skip-dir Library.")
+    ap.add_argument("--move", action="store_true",
+                    help="DELETE source files after successful upload. Files that "
+                         "MD5-match an existing B2 copy (status=duplicate) are NOT "
+                         "deleted — re-run without --move to inspect those, or "
+                         "delete manually after verifying on B2.")
     args = ap.parse_args()
 
     source = Path(args.source).resolve()
@@ -494,7 +599,10 @@ def main():
     conn = init_db(Path(args.manifest))
 
     log.info("walking source...")
-    paths = list(walk_media(source))
+    if args.skip_dir:
+        log.info("extra skip dirs: %s", args.skip_dir)
+    paths, json_dirs = walk_media(source, extra_skip_dirs=args.skip_dir)
+    log.info("dirs containing .json sidecars: %d", len(json_dirs))
     log.info("found %d media files", len(paths))
 
     log.info("grouping sidecars...")
@@ -521,20 +629,62 @@ def main():
             exif_cache[os.path.abspath(k)] = v
         log.info("  exif progress: %d / %d", min(i + args.exif_batch, len(to_read)), len(to_read))
 
-    log.info("scanning for Google Takeout JSON sidecars...")
-    takeout_cache = read_takeout_dates(to_read, log)
-    log.info("  takeout sidecars resolved: %d / %d files", len(takeout_cache), len(to_read))
+    log.info("scanning for sidecar JSON dates (Takeout / osxphotos)...")
+    takeout_cache = read_takeout_dates(to_read, log, json_dirs=json_dirs)
+    log.info("  sidecar dates resolved: %d / %d files", len(takeout_cache), len(to_read))
 
-    totals = {"copied": 0, "copied_mtime": 0, "duplicate": 0, "unknown_date": 0, "skipped_resume": 0, "errors": 0}
+    totals = {"copied": 0, "copied_mtime": 0, "duplicate": 0, "unknown_date": 0, "skipped_resume": 0, "errors": 0, "moved_deleted": 0}
     t0 = time.time()
-    for idx, group in enumerate(groups, 1):
-        counts = process_group(group, conn, args.dest, log, args.dry_run, exif_cache, takeout_cache)
-        for k, v in counts.items():
-            totals[k] += v
-        if idx % 50 == 0:
-            elapsed = time.time() - t0
-            log.info("progress: %d / %d groups, %.1fs elapsed, totals=%s",
-                     idx, len(groups), elapsed, totals)
+    log.info("processing %d groups with %d workers", len(groups), args.workers)
+    manifest_path = Path(args.manifest)
+
+    if args.workers <= 1:
+        # Serial path (kept for debugging and --workers 1 testing)
+        for idx, group in enumerate(groups, 1):
+            if idx % 100 == 0 and not source_root_alive(source):
+                log.error("source root no longer accessible: %s — aborting run, "
+                         "re-run after reconnecting", source)
+                break
+            counts = process_group(group, manifest_path, args.dest, log, args.dry_run,
+                                   exif_cache, takeout_cache, move_after_upload=args.move)
+            for k, v in counts.items():
+                totals[k] += v
+            if idx % 50 == 0:
+                elapsed = time.time() - t0
+                log.info("progress: %d / %d groups, %.1fs elapsed, totals=%s",
+                         idx, len(groups), elapsed, totals)
+    else:
+        # Parallel path
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = [
+                executor.submit(process_group, group, manifest_path, args.dest, log,
+                                args.dry_run, exif_cache, takeout_cache, args.move)
+                for group in groups
+            ]
+            aborted = False
+            for idx, fut in enumerate(as_completed(futures), 1):
+                # Check drive every 100 completions; on disconnect, stop submitting
+                # and let in-flight tasks fail naturally (they'll record as errors).
+                if idx % 100 == 0 and not source_root_alive(source):
+                    if not aborted:
+                        log.error("source root no longer accessible: %s — cancelling "
+                                  "remaining work", source)
+                        aborted = True
+                    for f in futures:
+                        f.cancel()
+                try:
+                    counts = fut.result()
+                except Exception as e:
+                    log.error("worker exception: %s", e)
+                    totals["errors"] += 1
+                    continue
+                for k, v in counts.items():
+                    totals[k] += v
+                if idx % 50 == 0:
+                    elapsed = time.time() - t0
+                    rate = idx / elapsed if elapsed else 0
+                    log.info("progress: %d / %d groups, %.1fs elapsed (%.1f/s), totals=%s",
+                             idx, len(groups), elapsed, rate, totals)
 
     log.info("=" * 60)
     log.info("DONE in %.1fs. groups=%d totals=%s", time.time() - t0, len(groups), totals)
